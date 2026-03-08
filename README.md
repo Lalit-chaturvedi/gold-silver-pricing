@@ -21,63 +21,13 @@ npm -v
 
 ## Running Locally
 
-### Step 1 — Create the project
-
-```bash
-npm create vite@latest gold-silver-tracker -- --template react
-cd gold-silver-tracker
-```
-
-### Step 2 — Replace the default files
-
-**Replace** `src/App.jsx` with the provided `gold-silver-tracker.jsx` file.
-
-**Replace** `index.html` with:
-```html
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Gold · Silver</title>
-    <style>
-      * { margin: 0; padding: 0; box-sizing: border-box; }
-      html, body, #root { width: 100%; min-height: 100vh; }
-    </style>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
-```
-
-**Replace** `src/main.jsx` with:
-```jsx
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import App from './App.jsx'
-
-createRoot(document.getElementById('root')).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
-```
-
-**Delete** `src/index.css` and remove its import from `main.jsx`:
-```bash
-rm src/index.css
-```
-> ⚠️ The default Vite CSS sets a max-width that breaks the full-screen layout.
-
-### Step 3 — Install dependencies
+### Step 1 — Install dependencies
 
 ```bash
 npm install
 ```
 
-### Step 4 — Start the dev server
+### Step 2 — Start the dev server
 
 ```bash
 npm run dev
