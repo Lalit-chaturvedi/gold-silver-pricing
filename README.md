@@ -21,30 +21,7 @@ npm -v
 
 ## Running Locally
 
-> ⚠️ The default Vite CSS sets a max-width that breaks the full-screen layout.
-
 ### Step 1 — Install dependencies
-
-```bash
-npm install
-```
-
-### Step 2 — Start the dev server
-
-```bash
-npm run dev
-```
-
-
-# Gold · Silver Tracker
-
-## Requirements
-- Node.js v18+
-- Twilio account
-
----
-
-## Step 1 — Backend
 
 ```bash
 cd backend
