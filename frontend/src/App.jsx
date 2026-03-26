@@ -1,16 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const API_URL       = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc/V1/MarketFeed";
-const OTP_SERVER    = "http://localhost:4000"; // Change to your server URL in production
+const OTP_SERVER = "https://fosterdigitalmedia.com"; // Your backend server URL
 
 const GOLD_SCRIPS = [
-  { label: "GOLD",  sublabel: "Standard Contract", Exch: "M", ExchType: "D", ScripCode: "57592", unit: "10g",  metal: "gold" },
-  { label: "GOLDM", sublabel: "Mini Contract",     Exch: "M", ExchType: "D", ScripCode: "57607", unit: "1g",   metal: "gold" },
+  { label: "GOLD",  productLabel: "Gold 99.5",   sublabel: "Hajar", Exch: "M", ExchType: "D", ScripCode: "57592", unit: "10g",  metal: "gold" },
+  { label: "GOLDM", productLabel: "Gold 99.5",   sublabel: "T+2",   Exch: "M", ExchType: "D", ScripCode: "57607", unit: "1g",   metal: "gold" },
 ];
 const SILVER_SCRIPS = [
-  { label: "SILVER",  sublabel: "Standard Contract", Exch: "M", ExchType: "D", ScripCode: "57630", unit: "1kg",  metal: "silver" },
-  { label: "SILVERM", sublabel: "Mini Contract",     Exch: "M", ExchType: "D", ScripCode: "57631", unit: "100g", metal: "silver" },
+  { label: "SILVER",  productLabel: "Silver 99.00", sublabel: "Hajar", Exch: "M", ExchType: "D", ScripCode: "57630", unit: "1kg",  metal: "silver" },
+  { label: "SILVERM", productLabel: "Silver 99.00", sublabel: "T+2",   Exch: "M", ExchType: "D", ScripCode: "57631", unit: "100g", metal: "silver" },
 ];
 const ALL_SCRIPS = [...GOLD_SCRIPS, ...SILVER_SCRIPS];
 const ADMIN_CREDENTIALS = { username: "admin", password: "admin@123" };
@@ -19,9 +18,9 @@ const OTP_RESEND_COOLDOWN = 30; // seconds
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
 const storage = {
-  get: (k, d) => { try { const v = sessionStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
-  set: (k, v) => { try { sessionStorage.setItem(k, JSON.stringify(v)); } catch {} },
-  del: (k)    => { try { sessionStorage.removeItem(k); } catch {} },
+  get: (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  del: (k)    => { try { localStorage.removeItem(k); } catch {} },
 };
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -44,25 +43,25 @@ function useWindowWidth() {
   return w;
 }
 
-// ─── Mock price data ──────────────────────────────────────────────────────────
-async function fetchAllPrices(apiKey, accessToken) {
-  const body = {
-    head: { key: apiKey },
-    body: {
-      Count: ALL_SCRIPS.length,
-      MarketFeedData: ALL_SCRIPS.map(s => ({ Exch: s.Exch, ExchType: s.ExchType, ScripCode: s.ScripCode, ScripData: "" })),
-      ClientLoginType: 0, LastRequestTime: "/Date(0)/", RefreshRate: "H",
-    },
-  };
-  const res = await fetch(API_URL, {
+// ─── Fetch prices via backend proxy (avoids CORS) ────────────────────────────
+async function fetchAllPrices() {
+  const res = await fetch(`${OTP_SERVER}/api/market-feed`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(accessToken ? { Authorization: `bearer ${accessToken}` } : {}) },
-    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      Count:          ALL_SCRIPS.length,
+      MarketFeedData: ALL_SCRIPS.map(s => ({
+        Exch:      s.Exch,
+        ExchType:  s.ExchType,
+        ScripCode: s.ScripCode,
+        ScripData: "",
+      })),
+    }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  if (data?.body?.Status !== 0 && data?.body?.Status !== undefined) throw new Error(data?.body?.Message || "API error");
-  return data?.body?.Data || [];
+  if (!data.success) throw new Error(data.message || "Market feed error");
+  return data.data || [];
 }
 
 function getMockData() {
@@ -329,9 +328,10 @@ function OtpPage({ userData, onVerified, onBack }) {
       });
       const data = await res.json();
       if (!data.success) throw new Error(data.message);
-      // Save session
-      storage.set("user", data.user);
-      onVerified(data.user);
+      // Save session with timestamp
+      const userWithTime = { ...data.user, loginAt: Date.now() };
+      storage.set("user", userWithTime);
+      onVerified(userWithTime);
     } catch (e) {
       setError(e.message || "Verification failed.");
       triggerShake();
@@ -501,145 +501,144 @@ function OtpPage({ userData, onVerified, onBack }) {
   );
 }
 
-// ─── PRICE CARD ───────────────────────────────────────────────────────────────
-function PriceCard({ scrip, data, commission, commissionType, idx }) {
-  const isGold     = scrip.metal === "gold";
-  const ltp        = data?.LastRate ?? 0;
-  const pclose     = data?.PClose ?? 0;
-  const change     = ltp - pclose;
-  const changePct  = pclose ? (change / pclose) * 100 : 0;
-  const isUp       = change >= 0;
-  const commVal    = commissionType === "percent" ? ltp * (commission / 100) : commission;
-  const finalPrice = ltp + commVal;
-  const tickDate   = parseTickDate(data?.TickDt);
+// ─── PRICE ROW — Buy/Sell layout matching the design ─────────────────────────
+function PriceRow({ scrip, data, buyCommission, buyCommissionType, sellCommission, sellCommissionType, idx }) {
+  const isGold    = scrip.metal === "gold";
+  const ltp       = data?.LastRate ?? 0;
+  const pclose    = data?.PClose ?? 0;
+  const change    = ltp - pclose;
+  const changePct = pclose ? (change / pclose) * 100 : 0;
+  const isUp      = change >= 0;
+  const tickDate  = parseTickDate(data?.TickDt);
 
   const accent     = isGold ? "#D4A847" : "#8BACC0";
   const accentText = isGold ? "#F5E199" : "#C8DCF0";
-  const upColor    = "#5FD988";
-  const downColor  = "#F07070";
+
+  // Buy = LTP - buyCommission (cheaper for buyer)
+  const buyCommVal  = buyCommissionType  === "percent" ? ltp * (buyCommission  / 100) : buyCommission;
+  const sellCommVal = sellCommissionType === "percent" ? ltp * (sellCommission / 100) : sellCommission;
+  const buyPrice    = Math.max(0, ltp - buyCommVal);
+  const sellPrice   = ltp + sellCommVal;
 
   return (
     <div className="price-card" style={{
       background: isGold
-        ? "linear-gradient(160deg, #181008 0%, #221808 60%, #14100A 100%)"
-        : "linear-gradient(160deg, #0A1018 0%, #101C28 60%, #08101A 100%)",
-      border: `1px solid ${accent}28`,
-      borderRadius: 20, padding: "28px 24px",
+        ? "linear-gradient(160deg, #131008 0%, #1C1408 100%)"
+        : "linear-gradient(160deg, #0A1018 0%, #0E1A26 100%)",
+      border: `1px solid ${accent}22`,
+      borderRadius: 16, padding: "20px 22px",
       position: "relative", overflow: "hidden",
       transition: "transform 0.3s ease, box-shadow 0.3s ease",
-      animationDelay: `${idx * 0.1}s`, width: "100%",
+      animationDelay: `${idx * 0.08}s`,
+      borderLeft: `3px solid ${accent}80`,
     }}>
-      <div style={{
-        position: "absolute", top: 0, left: "10%", right: "10%", height: 1,
-        background: `linear-gradient(90deg, transparent, ${accent}60, transparent)`,
-      }} />
-      <div style={{
-        position: "absolute", top: -60, right: -60, width: 180, height: 180, borderRadius: "50%",
-        background: `radial-gradient(circle, ${accent}10 0%, transparent 70%)`, pointerEvents: "none",
-      }} />
+      {/* top shimmer */}
+      <div style={{ position: "absolute", top: 0, left: "5%", right: "5%", height: 1, background: `linear-gradient(90deg, transparent, ${accent}40, transparent)` }} />
 
       {data?._mock && (
         <span style={{
-          position: "absolute", top: 14, right: 14, fontSize: 8, color: "#2A2A2A",
-          background: "#111", border: "1px solid #222", padding: "2px 8px", borderRadius: 20, letterSpacing: 2,
+          position: "absolute", top: 10, right: 10, fontSize: 7, color: "#2A2A2A",
+          background: "#111", border: "1px solid #222", padding: "2px 7px", borderRadius: 20, letterSpacing: 2,
         }}>DEMO</span>
       )}
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", alignItems: "center", gap: 12 }}>
+
+        {/* ── Left: Product info ── */}
         <div>
-          <div style={{ fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: 22, fontWeight: 700, color: accentText, letterSpacing: 1.5 }}>
-            {scrip.label}
+          <div style={{ fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: 20, fontWeight: 700, color: accentText, letterSpacing: 1 }}>
+            {scrip.productLabel || scrip.label}
           </div>
-          <div style={{ fontSize: 11, color: accent + "80", letterSpacing: 2, marginTop: 6 }}>
-            {scrip.sublabel} &nbsp;·&nbsp; per {scrip.unit}
-          </div>
-        </div>
-        <div style={{
-          fontSize: 12, fontWeight: 700, color: isUp ? upColor : downColor,
-          background: isUp ? "#0D2016" : "#200D0D",
-          border: `1px solid ${isUp ? "#1A4828" : "#481A1A"}`,
-          padding: "5px 11px", borderRadius: 8, whiteSpace: "nowrap",
-        }}>
-          {isUp ? "▲" : "▼"} {fmt(Math.abs(changePct))}%
-        </div>
-      </div>
-
-      <div style={{ height: 1, background: `${accent}18`, marginBottom: 20 }} />
-
-      <div style={{ marginBottom: 20 }}>
-        <div style={{ fontSize: 9, color: accent + "60", letterSpacing: 3, marginBottom: 8, fontWeight: 700 }}>MARKET PRICE</div>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 5 }}>
-          <span style={{ fontSize: 18, color: accent + "CC", fontWeight: 700, lineHeight: 1 }}>₹</span>
-          <span style={{
-            fontFamily: "'Cormorant Garamond', Georgia, serif",
-            fontSize: "clamp(32px, 5vw, 46px)", fontWeight: 700,
-            color: accentText, letterSpacing: -1, lineHeight: 1, fontVariantNumeric: "tabular-nums",
-          }}>{fmt(ltp)}</span>
-        </div>
-        <div style={{ fontSize: 13, marginTop: 8, fontWeight: 600, color: isUp ? upColor : downColor }}>
-          {isUp ? "+" : "−"}₹{fmt(Math.abs(change))} today
-        </div>
-      </div>
-
-      {commission > 0 && (
-        <div style={{
-          background: `${accent}08`, border: `1px solid ${accent}22`,
-          borderRadius: 14, padding: "14px 16px", marginBottom: 20,
-        }}>
-          <div style={{ fontSize: 9, color: accent + "80", letterSpacing: 3, marginBottom: 6, fontWeight: 700 }}>YOUR PRICE</div>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 5 }}>
-            <span style={{ fontSize: 14, color: accent, fontWeight: 700 }}>₹</span>
-            <span style={{ fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: "clamp(24px, 4vw, 34px)", fontWeight: 700, color: accent }}>
-              {fmt(finalPrice)}
-            </span>
-          </div>
-          <div style={{ fontSize: 11, color: accent + "60", marginTop: 5 }}>
-            +₹{fmt(commVal)} {commissionType === "percent" ? `(${commission}%)` : "(flat)"}
-          </div>
-        </div>
-      )}
-
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-        {[
-          { label: "HIGH",  value: data?.High,   color: upColor },
-          { label: "LOW",   value: data?.Low,    color: downColor },
-          { label: "CLOSE", value: data?.PClose, color: accent + "70" },
-        ].map(s => (
-          <div key={s.label} style={{
-            background: "#FFFFFF04", border: "1px solid #FFFFFF07",
-            borderRadius: 10, padding: "10px 8px", textAlign: "center",
+          <div style={{
+            display: "inline-block", marginTop: 6,
+            background: `${accent}15`, border: `1px solid ${accent}30`,
+            borderRadius: 5, padding: "2px 8px",
+            fontSize: 10, color: accent + "CC", letterSpacing: 1, fontWeight: 700,
           }}>
-            <div style={{ fontSize: 8, color: "#707070", letterSpacing: 2, marginBottom: 5, fontWeight: 700 }}>{s.label}</div>
-            <div style={{ fontSize: 12, fontWeight: 800, color: s.color }}>
-              {s.value ? `₹${fmt(s.value)}` : "—"}
-            </div>
+            {scrip.sublabel}
           </div>
-        ))}
-      </div>
-
-      {tickDate && (
-        <div style={{ marginTop: 14, fontSize: 9, color: "#404040", textAlign: "right", fontFamily: "monospace" }}>
-          {fmtTime(tickDate)}
+          <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{
+              fontSize: 10, fontWeight: 700,
+              color: isUp ? "#5FD988" : "#F07070",
+            }}>
+              {isUp ? "▲" : "▼"} {fmt(Math.abs(changePct))}%
+            </span>
+            {tickDate && <span style={{ fontSize: 9, color: "#2A3A4A", fontFamily: "monospace" }}>· {fmtTime(tickDate)}</span>}
+          </div>
         </div>
-      )}
+
+        {/* ── Middle: BUY ── */}
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 8, color: "#5FD98880", letterSpacing: 3, fontWeight: 700, marginBottom: 6 }}>BUY</div>
+          <div style={{
+            fontFamily: "'Cormorant Garamond', Georgia, serif",
+            fontSize: "clamp(20px, 2.5vw, 28px)", fontWeight: 700,
+            color: "#5FD988", lineHeight: 1, fontVariantNumeric: "tabular-nums",
+          }}>
+            ₹{fmt(buyPrice)}
+          </div>
+          <div style={{ fontSize: 9, color: "#3A5040", marginTop: 4 }}>per unit</div>
+        </div>
+
+        {/* ── Right: SELL ── */}
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 8, color: "#F0707080", letterSpacing: 3, fontWeight: 700, marginBottom: 6 }}>SELL</div>
+          <div style={{
+            fontFamily: "'Cormorant Garamond', Georgia, serif",
+            fontSize: "clamp(20px, 2.5vw, 28px)", fontWeight: 700,
+            color: "#F07070", lineHeight: 1, fontVariantNumeric: "tabular-nums",
+          }}>
+            ₹{fmt(sellPrice)}
+          </div>
+          <div style={{ fontSize: 9, color: "#503A3A", marginTop: 4 }}>per unit</div>
+        </div>
+      </div>
     </div>
   );
 }
 
-function MetalSection({ metal, scrips, commission, commissionType, getDataForScrip, isMobile }) {
+// ─── METAL SECTION — header row + price rows ──────────────────────────────────
+function MetalSection({ metal, scrips, buyCommission, buyCommissionType, sellCommission, sellCommissionType, getDataForScrip }) {
   const isGold = metal === "gold";
   const accent = isGold ? "#D4A847" : "#8BACC0";
   return (
-    <div style={{ marginBottom: 48 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 22 }}>
-        <div style={{ fontSize: 9, color: accent + "AA", letterSpacing: 5, fontWeight: 700 }}>{isGold ? "GOLD" : "SILVER"}</div>
-        <div style={{ flex: 1, height: 1, background: `linear-gradient(90deg, ${accent}40, transparent)` }} />
-        <div style={{ fontSize: 9, color: accent + "50", letterSpacing: 3 }}>MCX</div>
+    <div style={{ marginBottom: 40 }}>
+      {/* Section header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+        <div style={{
+          width: 7, height: 7, borderRadius: "50%",
+          border: `2px solid ${accent}80`, background: "transparent", flexShrink: 0,
+        }} />
+        <div style={{ fontSize: 9, color: accent + "99", letterSpacing: 5, fontWeight: 700 }}>
+          {isGold ? "GOLD RATES" : "SILVER RATES"}
+        </div>
+        <div style={{ flex: 1, height: 1, background: `linear-gradient(90deg, ${accent}30, transparent)` }} />
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, 1fr)", gap: 16 }}>
+
+      {/* Column headers */}
+      <div style={{
+        display: "grid", gridTemplateColumns: "1fr 1fr 1fr",
+        padding: "0 22px", marginBottom: 8,
+      }}>
+        <div style={{ fontSize: 8, color: "#2A3A4A", letterSpacing: 3, fontWeight: 700 }}>PRODUCT</div>
+        <div style={{ fontSize: 8, color: "#2A3A4A", letterSpacing: 3, fontWeight: 700, textAlign: "center" }}>BUY</div>
+        <div style={{ fontSize: 8, color: "#2A3A4A", letterSpacing: 3, fontWeight: 700, textAlign: "center" }}>SELL</div>
+      </div>
+
+      {/* Rows */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {scrips.map((scrip, i) => (
-          <PriceCard key={scrip.ScripCode} scrip={scrip} data={getDataForScrip(scrip)}
-            commission={commission} commissionType={commissionType} idx={i} />
+          <PriceRow
+            key={scrip.ScripCode}
+            scrip={scrip}
+            data={getDataForScrip(scrip)}
+            buyCommission={buyCommission}
+            buyCommissionType={buyCommissionType}
+            sellCommission={sellCommission}
+            sellCommissionType={sellCommissionType}
+            idx={i}
+          />
         ))}
       </div>
     </div>
@@ -647,27 +646,58 @@ function MetalSection({ metal, scrips, commission, commissionType, getDataForScr
 }
 
 // ─── ADMIN PANEL ──────────────────────────────────────────────────────────────
-function AdminPanel({ commission, commissionType, onSave, apiKey, accessToken, onApiUpdate, onClose }) {
-  const [lc, setLc]         = useState(String(commission));
-  const [lt, setLt]         = useState(commissionType);
-  const [lk, setLk]         = useState(apiKey);
-  const [ltoken, setLtoken] = useState(accessToken);
-  const [saved, setSaved]   = useState(false);
-  const [err, setErr]       = useState("");
-
-  function save() {
-    const v = parseFloat(lc);
-    if (isNaN(v) || v < 0) { setErr("Enter a valid non-negative number"); return; }
-    if (lt === "percent" && v > 100) { setErr("Percent cannot exceed 100"); return; }
-    setErr(""); onSave(v, lt); onApiUpdate(lk.trim(), ltoken.trim());
-    setSaved(true); setTimeout(() => setSaved(false), 2000);
-  }
-
+function CommissionField({ label, color, value, type, onValueChange, onTypeChange }) {
   const inputStyle = {
     width: "100%", background: "#040609", border: "1px solid #1A2A3A",
-    borderRadius: 9, padding: "11px 13px", color: "#7090A8", fontSize: 14,
+    borderRadius: 9, padding: "10px 12px", color: "#7090A8", fontSize: 14,
     outline: "none", fontFamily: "inherit", boxSizing: "border-box",
   };
+  return (
+    <div style={{
+      background: "#06090F", border: `1px solid ${color}18`,
+      borderRadius: 12, padding: "16px",
+    }}>
+      <div style={{ fontSize: 9, color: color, letterSpacing: 3, fontWeight: 700, marginBottom: 12 }}>{label}</div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        {["flat", "percent"].map(t => (
+          <button key={t} onClick={() => onTypeChange(t)} style={{
+            flex: 1, padding: "8px 0", borderRadius: 8, cursor: "pointer",
+            border: `1px solid ${type === t ? color : "#1A2A3A"}`,
+            background: type === t ? color + "18" : "transparent",
+            color: type === t ? color : "#506878",
+            fontWeight: 700, fontSize: 11, transition: "all 0.2s", fontFamily: "inherit",
+          }}>{t === "flat" ? "₹ Flat" : "% Percent"}</button>
+        ))}
+      </div>
+      <input
+        value={value}
+        onChange={e => onValueChange(e.target.value)}
+        placeholder={type === "flat" ? "500" : "2.5"}
+        type="number" min="0"
+        style={inputStyle}
+      />
+    </div>
+  );
+}
+
+function AdminPanel({ buyCommission, buyCommissionType, sellCommission, sellCommissionType, onSave, onClose }) {
+  const [bc, setBc] = useState(String(buyCommission));
+  const [bt, setBt] = useState(buyCommissionType);
+  const [sc, setSc] = useState(String(sellCommission));
+  const [st, setSt] = useState(sellCommissionType);
+  const [saved, setSaved] = useState(false);
+  const [err, setErr]     = useState("");
+
+  function save() {
+    const bv = parseFloat(bc), sv = parseFloat(sc);
+    if (isNaN(bv) || bv < 0) { setErr("Enter a valid buy commission"); return; }
+    if (isNaN(sv) || sv < 0) { setErr("Enter a valid sell commission"); return; }
+    if (bt === "percent" && bv > 100) { setErr("Buy percent cannot exceed 100"); return; }
+    if (st === "percent" && sv > 100) { setErr("Sell percent cannot exceed 100"); return; }
+    setErr("");
+    onSave({ buyCommission: bv, buyCommissionType: bt, sellCommission: sv, sellCommissionType: st });
+    setSaved(true); setTimeout(() => setSaved(false), 2000);
+  }
 
   return (
     <div style={{
@@ -682,7 +712,7 @@ function AdminPanel({ commission, commissionType, onSave, apiKey, accessToken, o
         animation: "modalIn 0.3s cubic-bezier(.2,.8,.2,1)",
         maxHeight: "90vh", overflowY: "auto",
       }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 28 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
           <div>
             <div style={{ fontSize: 9, color: "#506878", letterSpacing: 3, marginBottom: 5 }}>CONFIGURATION</div>
             <div style={{ fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: 22, fontWeight: 700, color: "#8090A0" }}>Admin Settings</div>
@@ -690,36 +720,34 @@ function AdminPanel({ commission, commissionType, onSave, apiKey, accessToken, o
           <button onClick={onClose} style={{ width: 36, height: 36, borderRadius: "50%", border: "1px solid #1A2A3A", background: "none", color: "#506878", cursor: "pointer", fontSize: 16 }}>✕</button>
         </div>
 
-        <div style={{ fontSize: 8, color: "#506878", letterSpacing: 3, marginBottom: 14, fontWeight: 700 }}>API CONFIGURATION</div>
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 9, color: "#506878", letterSpacing: 2, marginBottom: 7 }}>5PAISA VENDOR KEY</div>
-          <input value={lk} onChange={e => setLk(e.target.value)} placeholder="Vendor / App Key" style={inputStyle} />
+        {/* API info banner */}
+        <div style={{
+          background: "#0A1E10", border: "1px solid #1A3A20", borderRadius: 10,
+          padding: "12px 16px", marginBottom: 22, fontSize: 11, color: "#4A8A5A", lineHeight: 1.6,
+        }}>
+          🔑 <strong style={{ color: "#5FD988" }}>API keys are managed on the server.</strong><br />
+          Set <code style={{ color: "#C9A84C" }}>FIVE_PAISA_KEY</code> and <code style={{ color: "#C9A84C" }}>FIVE_PAISA_TOKEN</code> in your <code style={{ color: "#C9A84C" }}>.env</code> file.
         </div>
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 9, color: "#506878", letterSpacing: 2, marginBottom: 7 }}>ACCESS TOKEN</div>
-          <input value={ltoken} onChange={e => setLtoken(e.target.value)} placeholder="Bearer token (optional)" type="password" style={inputStyle} />
-        </div>
-        <div style={{ height: 1, background: "#0A1E2A", margin: "22px 0" }} />
 
-        <div style={{ fontSize: 8, color: "#506878", letterSpacing: 3, marginBottom: 14, fontWeight: 700 }}>COMMISSION</div>
-        <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
-          {["flat", "percent"].map(t => (
-            <button key={t} onClick={() => setLt(t)} style={{
-              flex: 1, padding: "10px 0", borderRadius: 9, cursor: "pointer",
-              border: `1px solid ${lt === t ? "#D4A847" : "#1A2A3A"}`,
-              background: lt === t ? "#D4A84714" : "transparent",
-              color: lt === t ? "#D4A847" : "#506878",
-              fontWeight: 700, fontSize: 12, transition: "all 0.2s", fontFamily: "inherit",
-            }}>{t === "flat" ? "₹ Flat" : "% Percent"}</button>
-          ))}
+        <div style={{ fontSize: 8, color: "#506878", letterSpacing: 3, marginBottom: 14, fontWeight: 700 }}>COMMISSION SETTINGS</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 18 }}>
+          <CommissionField
+            label="BUY COMMISSION (deducted from price)"
+            color="#5FD988"
+            value={bc} type={bt}
+            onValueChange={setBc} onTypeChange={setBt}
+          />
+          <CommissionField
+            label="SELL COMMISSION (added to price)"
+            color="#F07070"
+            value={sc} type={st}
+            onValueChange={setSc} onTypeChange={setSt}
+          />
         </div>
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 9, color: "#506878", letterSpacing: 2, marginBottom: 7 }}>VALUE {lt === "flat" ? "(₹)" : "(%)"}</div>
-          <input value={lc} onChange={e => setLc(e.target.value)} placeholder={lt === "flat" ? "500" : "2.5"} type="number" min="0" style={inputStyle} />
-        </div>
-        {err && <div style={{ color: "#F07070", fontSize: 11, marginBottom: 8 }}>{err}</div>}
+
+        {err && <div style={{ color: "#F07070", fontSize: 11, marginBottom: 10 }}>{err}</div>}
         <button onClick={save} style={{
-          width: "100%", padding: "13px", marginTop: 6, borderRadius: 11, cursor: "pointer",
+          width: "100%", padding: "13px", borderRadius: 11, cursor: "pointer",
           background: saved ? "#0D2016" : "linear-gradient(135deg, #C9A84C, #ECC84A)",
           border: saved ? "1px solid #1D4828" : "none",
           color: saved ? "#5FD988" : "#1A0E00",
@@ -799,13 +827,12 @@ function TrackerApp({ user, onLogout }) {
   const [lastUpdated, setLastUpdated] = useState(null);
   const [error, setError]             = useState(null);
   const [useMock, setUseMock]         = useState(false);
-  const [tab, setTab]                 = useState("all");
   const [countdown, setCountdown]     = useState(REFRESH_INTERVAL / 1000);
 
-  const [commission, setCommission]       = useState(() => storage.get("commission", 0));
-  const [commissionType, setCommissionType] = useState(() => storage.get("commissionType", "flat"));
-  const [apiKey, setApiKey]               = useState(() => storage.get("apiKey", ""));
-  const [accessToken, setAccessToken]     = useState(() => storage.get("accessToken", ""));
+  const [buyCommission, setBuyCommission]         = useState(() => storage.get("buyCommission", 0));
+  const [buyCommissionType, setBuyCommissionType] = useState(() => storage.get("buyCommissionType", "flat"));
+  const [sellCommission, setSellCommission]       = useState(() => storage.get("sellCommission", 0));
+  const [sellCommissionType, setSellCommissionType] = useState(() => storage.get("sellCommissionType", "flat"));
 
   const [showAdminLogin, setShowAdminLogin] = useState(false);
   const [showAdminPanel, setShowAdminPanel] = useState(false);
@@ -818,12 +845,17 @@ function TrackerApp({ user, onLogout }) {
   const fetchPrices = useCallback(async () => {
     setLoading(true); setError(null);
     try {
-      if (!apiKey) { setPrices(getMockData()); setUseMock(true); }
-      else { setPrices(await fetchAllPrices(apiKey, accessToken)); setUseMock(false); }
-      setLastUpdated(new Date()); setCountdown(REFRESH_INTERVAL / 1000);
-    } catch (e) { setError(e.message); setPrices(getMockData()); setUseMock(true); }
+      setPrices(await fetchAllPrices());
+      setUseMock(false);
+      setLastUpdated(new Date());
+      setCountdown(REFRESH_INTERVAL / 1000);
+    } catch (e) {
+      setError(e.message);
+      setPrices(getMockData());
+      setUseMock(true);
+    }
     setLoading(false);
-  }, [apiKey, accessToken]);
+  }, []);
 
   useEffect(() => {
     fetchPrices();
@@ -841,12 +873,7 @@ function TrackerApp({ user, onLogout }) {
     return prices.find(p => String(p.Token) === s.ScripCode || String(p.ScripCode) === s.ScripCode) || prices[ALL_SCRIPS.indexOf(s)];
   }
 
-  const gd0 = getDataForScrip(GOLD_SCRIPS[0]);
-  const sd0 = getDataForScrip(SILVER_SCRIPS[0]);
-  const goldLTP    = gd0?.LastRate || 0;
-  const silverLTP  = sd0?.LastRate || 0;
-  const goldChg    = gd0 ? gd0.LastRate - gd0.PClose : 0;
-  const silverChg  = sd0 ? sd0.LastRate - sd0.PClose : 0;
+
 
   return (
     <div style={{ minHeight: "100vh", background: "#04070D", fontFamily: "'Georgia', 'Palatino Linotype', serif", color: "#6080A0", overflowX: "hidden" }}>
@@ -963,100 +990,138 @@ function TrackerApp({ user, onLogout }) {
           )}
         </div>
 
-        {/* Hero */}
-        <div style={{
-          display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr",
-          gap: 14, marginBottom: isMobile ? 32 : 52,
-        }}>
-          {[
-            { label: "GOLD",   ltp: goldLTP,   chg: goldChg,   accent: "#D4A847", bg: "linear-gradient(140deg, #141008, #1C1408)" },
-            { label: "SILVER", ltp: silverLTP, chg: silverChg, accent: "#8BACC0", bg: "linear-gradient(140deg, #08101A, #0C1420)" },
-          ].map((m, i) => (
-            <div key={m.label} style={{
-              background: m.bg, border: `1px solid ${m.accent}22`,
-              borderRadius: 18, padding: isMobile ? "20px" : "24px 26px",
-              position: "relative", overflow: "hidden",
-              animation: `cardIn 0.5s ease ${i * 0.1}s both`,
-            }}>
-              <div style={{ position: "absolute", top: 0, left: "10%", right: "10%", height: 1, background: `linear-gradient(90deg, transparent, ${m.accent}50, transparent)` }} />
-              <div style={{ fontSize: 9, color: m.accent + "70", letterSpacing: 5, fontWeight: 700, marginBottom: 10 }}>{m.label} · MCX</div>
-              <div style={{ fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: isMobile ? 36 : "clamp(32px, 3.5vw, 44px)", fontWeight: 700, color: m.accent, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>
-                ₹{fmt(m.ltp)}
-              </div>
-              <div style={{ fontSize: 13, marginTop: 9, fontWeight: 600, color: m.chg >= 0 ? "#5FD988" : "#F07070" }}>
-                {m.chg >= 0 ? "+" : "−"}₹{fmt(Math.abs(m.chg))}
-              </div>
-            </div>
-          ))}
-        </div>
-
         {/* Banners */}
         {useMock && (
           <div style={{ fontSize: 11, color: "#7A6020", background: "#C9A84708", border: "1px solid #C9A84718", borderRadius: 10, padding: "10px 16px", marginBottom: 24, display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ opacity: 0.5 }}>◈</span> Demo mode — add your 5paisa API key in Admin for live data
+            <span style={{ opacity: 0.5 }}>◈</span> Demo mode — set FIVE_PAISA_KEY in your server .env file for live data
           </div>
         )}
         {error && (
           <div style={{ fontSize: 11, color: "#805050", background: "#F0606806", border: "1px solid #F0606815", borderRadius: 10, padding: "10px 16px", marginBottom: 24 }}>⚠ {error}</div>
         )}
-        {commission > 0 && (
-          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, color: "#7A6020", background: "#C9A84706", border: "1px solid #C9A84715", borderRadius: 20, padding: "6px 14px", marginBottom: 24 }}>
-            Commission: {commissionType === "percent" ? `${commission}%` : `₹${fmt(commission)}`}
+
+        {/* Gold & Silver sections — no tabs, always show both */}
+        <MetalSection
+          metal="gold" scrips={GOLD_SCRIPS}
+          buyCommission={buyCommission} buyCommissionType={buyCommissionType}
+          sellCommission={sellCommission} sellCommissionType={sellCommissionType}
+          getDataForScrip={getDataForScrip}
+        />
+        <MetalSection
+          metal="silver" scrips={SILVER_SCRIPS}
+          buyCommission={buyCommission} buyCommissionType={buyCommissionType}
+          sellCommission={sellCommission} sellCommissionType={sellCommissionType}
+          getDataForScrip={getDataForScrip}
+        />
+
+        {/* ── Booking & Trading Rules Card ── */}
+        <div style={{
+          background: "linear-gradient(160deg, #0C1220, #080E18)",
+          border: "1px solid #1A2A3A", borderRadius: 20,
+          padding: isMobile ? "24px 20px" : "28px 32px",
+          marginTop: 8, marginBottom: 32,
+        }}>
+          {/* Phone booking */}
+          <div style={{ display: "flex", alignItems: "center", gap: 18, marginBottom: 24 }}>
+            <div style={{
+              width: 54, height: 54, borderRadius: 14, flexShrink: 0,
+              background: "linear-gradient(135deg, #C9A84C, #ECC84A)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 22, boxShadow: "0 8px 24px #C9A84C30",
+            }}>📞</div>
+            <div>
+              <div style={{ fontSize: 9, color: "#506878", letterSpacing: 4, marginBottom: 5 }}>FOR BOOKING, CALL</div>
+              <div style={{
+                fontFamily: "'Cormorant Garamond', Georgia, serif",
+                fontSize: isMobile ? 24 : 30, fontWeight: 700, letterSpacing: 2,
+                background: "linear-gradient(90deg, #C9A847, #ECC84A)",
+                WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+              }}>777-1-919191</div>
+            </div>
           </div>
-        )}
 
-        {/* Tabs */}
-        <div style={{ display: "flex", borderBottom: "1px solid #0A1828", marginBottom: 32 }}>
-          {[{ id: "all", label: "ALL MARKETS", accent: "#5A7090" }, { id: "gold", label: "GOLD", accent: "#D4A847" }, { id: "silver", label: "SILVER", accent: "#8BACC0" }].map(t => (
-            <button key={t.id} onClick={() => setTab(t.id)} style={{
-              padding: isMobile ? "10px 14px" : "10px 22px", background: "none", border: "none",
-              borderBottom: `2px solid ${tab === t.id ? t.accent : "transparent"}`,
-              color: tab === t.id ? t.accent : "#3A5060",
-              cursor: "pointer", fontSize: 10, fontWeight: 700, letterSpacing: 2,
-              transition: "all 0.2s", marginBottom: "-1px", fontFamily: "inherit",
-            }}>{t.label}</button>
-          ))}
-        </div>
+          {/* Divider */}
+          <div style={{ height: 1, background: "linear-gradient(90deg, #1A2A3A, #0A1420, #1A2A3A)", marginBottom: 24 }} />
 
-        {(tab === "all" || tab === "gold") && (
-          <MetalSection metal="gold" scrips={GOLD_SCRIPS} commission={commission} commissionType={commissionType} getDataForScrip={getDataForScrip} isMobile={isMobile} />
-        )}
-        {(tab === "all" || tab === "silver") && (
-          <MetalSection metal="silver" scrips={SILVER_SCRIPS} commission={commission} commissionType={commissionType} getDataForScrip={getDataForScrip} isMobile={isMobile} />
-        )}
-
-        {/* Footer */}
-        <div style={{ borderTop: "1px solid #080E18", paddingTop: 24, marginTop: 8, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
-          <div style={{ display: "flex", gap: isMobile ? 16 : 28, flexWrap: "wrap" }}>
-            {[["Exchange", "MCX India"], ["Source", "5paisa API"], ["Refresh", `${REFRESH_INTERVAL / 1000}s`], ["Currency", "INR ₹"]].map(([l, v]) => (
-              <div key={l}>
-                <div style={{ fontSize: 7, color: "#2A3A4A", letterSpacing: 2, fontWeight: 700, marginBottom: 4 }}>{l}</div>
-                <div style={{ fontSize: 11, color: "#3A5060", fontWeight: 700 }}>{v}</div>
+          {/* Trading Rules */}
+          <div style={{ fontSize: 9, color: "#3A5060", letterSpacing: 4, fontWeight: 700, marginBottom: 16 }}>TRADING RULES</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {[
+              "Gold delivery is strictly done on the same day.",
+              "Silver delivery can be customized as per requirement.",
+              "Gold T+2 must be lifted within the specified time frame.",
+            ].map((rule, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+                <div style={{
+                  width: 26, height: 26, borderRadius: "50%", flexShrink: 0,
+                  background: "linear-gradient(135deg, #C9A84C22, #C9A84C38)",
+                  border: "1px solid #C9A84C40",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 11, fontWeight: 700, color: "#C9A84C",
+                }}>{i + 1}</div>
+                <div style={{ fontSize: 13, color: "#7090A0", lineHeight: 1.6, paddingTop: 3 }}>{rule}</div>
               </div>
             ))}
           </div>
         </div>
-        <div style={{ marginTop: 18, fontSize: 9, color: "#1A2A3A", textAlign: "center" }}>
-          Indicative prices only · Not financial advice
+
+        {/* Bottom disclaimer */}
+        <div style={{ textAlign: "center", paddingBottom: 16 }}>
+          <div style={{ fontSize: 10, color: "#2A3A4A" }}>
+            Rates are subject to market fluctuations &nbsp;•&nbsp; All prices in INR
+          </div>
         </div>
       </div>
 
       {showAdminLogin && <AdminLoginModal onLogin={() => { setAdminIn(true); setShowAdminLogin(false); setShowAdminPanel(true); }} onClose={() => setShowAdminLogin(false)} />}
       {showAdminPanel && (
-        <AdminPanel commission={commission} commissionType={commissionType} apiKey={apiKey} accessToken={accessToken}
-          onSave={(v, t) => { setCommission(v); setCommissionType(t); storage.set("commission", v); storage.set("commissionType", t); }}
-          onApiUpdate={(k, tok) => { setApiKey(k); setAccessToken(tok); storage.set("apiKey", k); storage.set("accessToken", tok); }}
-          onClose={() => setShowAdminPanel(false)} />
+        <AdminPanel
+          buyCommission={buyCommission} buyCommissionType={buyCommissionType}
+          sellCommission={sellCommission} sellCommissionType={sellCommissionType}
+          onSave={({ buyCommission: bv, buyCommissionType: bt, sellCommission: sv, sellCommissionType: st }) => {
+            setBuyCommission(bv);   storage.set("buyCommission", bv);
+            setBuyCommissionType(bt); storage.set("buyCommissionType", bt);
+            setSellCommission(sv);  storage.set("sellCommission", sv);
+            setSellCommissionType(st); storage.set("sellCommissionType", st);
+          }}
+          onClose={() => setShowAdminPanel(false)}
+        />
       )}
     </div>
   );
 }
 
+// ─── Session config ──────────────────────────────────────────────────────────
+const SESSION_DURATION_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+function loadValidSession() {
+  const user = storage.get("user", null);
+  if (!user || !user.loginAt) return null;
+  if (Date.now() - user.loginAt > SESSION_DURATION_MS) {
+    storage.del("user");
+    return null;
+  }
+  return user;
+}
+
 // ─── ROOT APP — handles auth flow ─────────────────────────────────────────────
 export default function App() {
-  // Check for existing session
-  const [user, setUser]           = useState(() => storage.get("user", null));
-  const [otpPending, setOtpPending] = useState(null); // { name, phone }
+  const [user, setUser]             = useState(() => loadValidSession());
+  const [otpPending, setOtpPending] = useState(null);
+
+  // Auto-logout timer — checks every minute if session has expired
+  useEffect(() => {
+    if (!user) return;
+    const interval = setInterval(() => {
+      const timeElapsed = Date.now() - user.loginAt;
+      if (timeElapsed >= SESSION_DURATION_MS) {
+        storage.del("user");
+        setUser(null);
+        alert("Your session has expired. Please log in again.");
+      }
+    }, 60 * 1000); // check every 60 seconds
+    return () => clearInterval(interval);
+  }, [user]);
 
   function handleLogout() {
     storage.del("user");
@@ -1064,7 +1129,6 @@ export default function App() {
     setOtpPending(null);
   }
 
-  // Not logged in → show login
   if (!user) {
     if (otpPending) {
       return (
@@ -1078,6 +1142,5 @@ export default function App() {
     return <LoginPage onOtpSent={(data) => setOtpPending(data)} />;
   }
 
-  // Logged in → show tracker
   return <TrackerApp user={user} onLogout={handleLogout} />;
 }
