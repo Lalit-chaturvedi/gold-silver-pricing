@@ -1,6 +1,6 @@
 // ─── Gold · Silver Tracker — OTP Backend Server ──────────────────────────────
 // Run: node server.js
-// Requires: npm install express twilio cors dotenv exceljs axios
+// Requires: npm install express twilio cors dotenv exceljs
 
 require("dotenv").config();
 const express  = require("express");
@@ -27,7 +27,7 @@ const OTP_EXPIRY   = 5 * 60 * 1000; // 5 minutes
 const MAX_ATTEMPTS = 3;
 
 // ── Excel File Setup ──────────────────────────────────────────────────────────
-const EXCEL_PATH = path.join(__dirname, "users.xlsx");
+const EXCEL_PATH = path.join(process.cwd(), "users.xlsx");
 
 async function getWorkbook() {
   const wb = new ExcelJS.Workbook();
@@ -80,6 +80,7 @@ async function upsertUser(name, phone10) {
   }
 
   await wb.xlsx.writeFile(EXCEL_PATH);
+  console.log(`📁 Excel saved at: ${EXCEL_PATH}`);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -182,123 +183,162 @@ app.post("/api/verify-otp", async (req, res) => {
   });
 });
 
-// ── 5paisa helper — raw HTTPS POST (no axios needed) ─────────────────────────
-function fivePaisaPost(apiPath, payload, extraHeaders = {}) {
+// ── Generic HTTPS GET helper ──────────────────────────────────────────────────
+function httpsGet(hostname, urlPath) {
   return new Promise((resolve, reject) => {
-    const bodyStr = JSON.stringify(payload);
-    const options = {
-      hostname: "Openapi.5paisa.com",
-      path:     apiPath,
-      method:   "POST",
-      headers:  {
-        "Content-Type":   "application/json",
-        "Content-Length": Buffer.byteLength(bodyStr),
-        ...extraHeaders,
-      },
-    };
-    const req = https.request(options, (resp) => {
-      let data = "";
-      resp.on("data", c => data += c);
-      resp.on("end", () => {
-        try { resolve(JSON.parse(data)); }
-        catch { reject(new Error("Invalid JSON from 5paisa")); }
-      });
-    });
+    const req = https.request(
+      { hostname, path: urlPath, method: "GET", headers: { "Accept": "application/json" } },
+      (resp) => {
+        console.log(`   HTTP ${resp.statusCode} ← https://${hostname}${urlPath}`);
+        let data = "";
+        resp.on("data", c => data += c);
+        resp.on("end", () => {
+          if (resp.statusCode !== 200)
+            return reject(new Error(`HTTP ${resp.statusCode} from ${hostname}${urlPath} → ${data.slice(0, 300)}`));
+          try { resolve(JSON.parse(data)); }
+          catch { reject(new Error(`Invalid JSON from ${hostname}${urlPath}`)); }
+        });
+      }
+    );
     req.on("error", reject);
-    req.write(bodyStr);
     req.end();
   });
 }
 
-// ── POST /api/market-feed  (proxies 5paisa — avoids browser CORS block) ───────
-app.post("/api/market-feed", async (req, res) => {
-  const vendorKey = process.env.FIVE_PAISA_KEY;
-  if (!vendorKey)
-    return res.status(500).json({ success: false, message: "FIVE_PAISA_KEY not set in .env" });
+// ── Defensive field extractor (handles any field names gold-api.com returns) ──
+function safeNum(val, fallback = 0) {
+  const n = parseFloat(val);
+  return isNaN(n) ? fallback : n;
+}
 
+function extractPrice(raw) {
+  // Accept any known field name variants
+  const price = safeNum(
+    raw.price ?? raw.Price ?? raw.ltp ?? raw.rate ?? raw.close, 0
+  );
+  return {
+    price,
+    open:      safeNum(raw.open      ?? raw.Open      ?? raw.open_price,  price),
+    high:      safeNum(raw.high      ?? raw.High      ?? raw.high_price,  price),
+    low:       safeNum(raw.low       ?? raw.Low       ?? raw.low_price,   price),
+    prevClose: safeNum(raw.prev_close ?? raw.prevClose ?? raw.previous_close ?? raw.close, price),
+    change:    safeNum(raw.ch        ?? raw.change    ?? raw.Change,      0),
+    changePct: safeNum(raw.chp       ?? raw.changePercent ?? raw.change_percent, 0),
+    updatedAt: raw.updatedAt ?? raw.timestamp ?? new Date().toISOString(),
+  };
+}
+
+// ── GET /api/market-feed ──────────────────────────────────────────────────────
+// Drops 5paisa entirely. Uses gold-api.com (free · no auth · unlimited).
+// Same response shape as before: { success, data: [{Symbol, LTP, ...}] }
+app.get("/api/market-feed", async (req, res) => {
   try {
-    const token = process.env.FIVE_PAISA_TOKEN || "";
-    const data  = await fivePaisaPost(
-      "/VendorsAPI/Service1.svc/V1/MarketFeed",
+    // Fetch Gold + Silver in parallel
+    const [goldRaw, silverRaw] = await Promise.all([
+      httpsGet("api.gold-api.com", "/price/XAU"),
+      httpsGet("api.gold-api.com", "/price/XAG"),
+    ]);
+
+    // Always log raw so you can see exact field names
+    console.log("🔍 Gold raw   :", JSON.stringify(goldRaw));
+    console.log("🔍 Silver raw :", JSON.stringify(silverRaw));
+
+    // Live USD → INR (frankfurter.app — free, no key)
+    let usdToInr = 86.5; // updated fallback for 2026
+    try {
+      const fx = await httpsGet("api.frankfurter.app", "/latest?from=USD&to=INR");
+      if (fx?.rates?.INR) usdToInr = fx.rates.INR;
+    } catch (e) {
+      console.warn("⚠️  FX fallback ₹86.5 —", e.message);
+    }
+    console.log(`💱 1 USD = ₹${usdToInr}`);
+
+    const gold   = extractPrice(goldRaw);
+    const silver = extractPrice(silverRaw);
+
+    const TROY_OZ = 31.1035; // grams per troy ounce
+
+    // ── India price premiums (precisely calibrated against live market) ────────
+    // India prices differ from raw USD→INR spot due to import duty + GST + MCX fees.
+    // Calibrated on 29 Mar 2026 by comparing app output vs actual Google/MCX rates:
+    //   App showed Gold ₹1,58,580 → target ₹1,48,090 → correction 0.9338
+    //   App showed Silver ₹2,63,209 → target ₹2,45,000 → correction 0.9308
+    //   Applied to previous premiums (1.181 & 1.261) → new values below.
+    const GOLD_PREMIUM   = 1.1029;  // calibrated: Gold ₹1,48,090/10g
+    const SILVER_PREMIUM = 1.1738;  // calibrated: Silver ₹2,45,000/kg
+
+    const goldPer10g  = (u) => parseFloat(((u / TROY_OZ) * usdToInr * 10   * GOLD_PREMIUM  ).toFixed(2));
+    const goldPerGram = (u) => parseFloat(((u / TROY_OZ) * usdToInr         * GOLD_PREMIUM  ).toFixed(2));
+    const silverPerKg = (u) => parseFloat(((u / TROY_OZ) * usdToInr * 1000 * SILVER_PREMIUM).toFixed(2));
+    const silverPerG  = (u) => parseFloat(((u / TROY_OZ) * usdToInr         * SILVER_PREMIUM).toFixed(2));
+
+    const data = [
       {
-        head: { key: vendorKey },
-        body: {
-          Count:           req.body.Count,
-          MarketFeedData:  req.body.MarketFeedData,
-          ClientLoginType: 0,
-          LastRequestTime: "/Date(0)/",
-          RefreshRate:     "H",
-        },
+        Symbol:        "GOLD",
+        Name:          "Gold (24K)",
+        Exch:          "INTL",
+        LTP:           goldPer10g(gold.price),
+        Open:          goldPer10g(gold.open),
+        High:          goldPer10g(gold.high),
+        Low:           goldPer10g(gold.low),
+        PreviousClose: goldPer10g(gold.prevClose),
+        Change:        gold.change,
+        ChangePercent: gold.changePct,
+        Unit:          "per 10g",
+        PerGram:       goldPerGram(gold.price),
+        USDPrice:      gold.price,
+        USDToINR:      usdToInr,
+        UpdatedAt:     gold.updatedAt,
       },
-      token ? { Authorization: `bearer ${token}` } : {}
-    );
+      {
+        Symbol:        "SILVER",
+        Name:          "Silver",
+        Exch:          "INTL",
+        LTP:           silverPerKg(silver.price),
+        Open:          silverPerKg(silver.open),
+        High:          silverPerKg(silver.high),
+        Low:           silverPerKg(silver.low),
+        PreviousClose: silverPerKg(silver.prevClose),
+        Change:        silver.change,
+        ChangePercent: silver.changePct,
+        Unit:          "per kg",
+        PerGram:       silverPerG(silver.price),
+        USDPrice:      silver.price,
+        USDToINR:      usdToInr,
+        UpdatedAt:     silver.updatedAt,
+      },
+    ];
 
-    if (data?.body?.Status !== 0 && data?.body?.Status !== undefined)
-      return res.status(400).json({ success: false, message: data?.body?.Message || "5paisa API error" });
+    console.log(`📈 Gold ₹${data[0].LTP}/10g | Silver ₹${data[1].LTP}/kg`);
+    res.json({ success: true, data });
 
-    console.log("📈 MarketFeed fetched:", (data?.body?.Data || []).length, "scrips");
-    res.json({ success: true, data: data?.body?.Data || [] });
   } catch (err) {
-    console.error("❌ 5paisa MarketFeed error:", err.message);
+    console.error("❌ /api/market-feed error:", err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ── POST /api/five-paisa-token  (generate & save access token — run once/day) ─
-app.post("/api/five-paisa-token", async (req, res) => {
-  const { appSource, userId, password, userKey, encryptionKey } = req.body;
-  if (!appSource || !userId || !password || !userKey || !encryptionKey)
-    return res.status(400).json({ success: false, message: "All 5 credentials are required." });
-
+// ── GET /api/debug-feed  (raw JSON dump from gold-api.com — for inspecting fields) ──
+app.get("/api/debug-feed", async (req, res) => {
   try {
-    // Step 1 — fetch server-side encryption key
-    const encRes = await fivePaisaPost("/VendorsAPI/Service1.svc/EncryptionKey", {
-      head: { key: userKey },
-      body: { ClientLoginType: 0 },
-    });
-    const encKey = encRes?.body?.EncryptionKey;
-    if (!encKey) throw new Error("Could not fetch EncryptionKey from 5paisa");
-
-    // Step 2 — SHA-256 hash: encKey + password
-    const crypto       = require("crypto");
-    const encryptedPwd = crypto.createHash("sha256").update(encKey + password).digest("hex").toUpperCase();
-
-    // Step 3 — login to get RequestToken
-    const loginRes = await fivePaisaPost("/VendorsAPI/Service1.svc/V3/LoginRequestMobileNewbyEmail", {
-      head: { key: userKey, appVer: "1.0", osName: "Web" },
-      body: {
-        Email_id: userId, Password: encryptedPwd,
-        LocalIP: "127.0.0.1", PublicIP: "127.0.0.1",
-        HDSerialNumber: "", MACAddress: "", MachineID: "WEB",
-        VersionNo: "1.7", RequestNo: "1",
-        My2PIN: encryptionKey, ConnectionType: "1",
-      },
-    });
-    const requestToken = loginRes?.body?.RequestToken;
-    if (!requestToken || loginRes?.body?.Status !== 0)
-      throw new Error(loginRes?.body?.Message || "5paisa login failed — check your credentials");
-
-    // Step 4 — exchange RequestToken for AccessToken
-    const accessRes  = await fivePaisaPost("/VendorsAPI/Service1.svc/GetAccessToken", {
-      head: { key: userKey },
-      body: { RequestToken: requestToken, EncryptionKey: encKey },
-    });
-    const accessToken = accessRes?.body?.AccessToken;
-    if (!accessToken) throw new Error("Failed to obtain AccessToken");
-
-    // Auto-apply for this process lifetime
-    process.env.FIVE_PAISA_TOKEN = accessToken;
-    console.log("✅ 5paisa AccessToken generated and applied");
-
-    res.json({
-      success: true,
-      accessToken,
-      message: "Token is active. Also add it to your .env as FIVE_PAISA_TOKEN to persist across restarts.",
-    });
+    const [gold, silver] = await Promise.all([
+      httpsGet("api.gold-api.com", "/price/XAU"),
+      httpsGet("api.gold-api.com", "/price/XAG"),
+    ]);
+    res.json({ gold, silver });
   } catch (err) {
-    console.error("❌ 5paisa token error:", err.message);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({ error: err.message });
   }
+});
+
+// ── GET /api/download-users ───────────────────────────────────────────────────
+app.get("/api/download-users", (req, res) => {
+  if (!fs.existsSync(EXCEL_PATH)) {
+    return res.status(404).json({ message: "No users file yet. Login first." });
+  }
+  res.setHeader("Content-Disposition", "attachment; filename=users.xlsx");
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  fs.createReadStream(EXCEL_PATH).pipe(res);
 });
 
 // ── GET /api/health ───────────────────────────────────────────────────────────
@@ -306,15 +346,19 @@ app.get("/api/health", (_, res) => res.json({
   status:      "ok",
   twilio:      process.env.TWILIO_ACCOUNT_SID ? "✓ configured" : "✗ missing",
   excel:       fs.existsSync(EXCEL_PATH)       ? "✓ exists"     : "will be created on first login",
-  fivePaisa:   process.env.FIVE_PAISA_KEY      ? "✓ key set"    : "✗ FIVE_PAISA_KEY missing",
-  token:       process.env.FIVE_PAISA_TOKEN    ? "✓ token set"  : "✗ no token (demo mode active)",
+  excelPath:   EXCEL_PATH,
+  cwd:         process.cwd(),
+  marketData:  "✓ gold-api.com (free · no auth · no rate limit)",
 }));
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`\n🚀 OTP Server running on http://localhost:${PORT}`);
-  console.log(`   Twilio Account: ${process.env.TWILIO_ACCOUNT_SID   ? "✓ configured" : "✗ missing"}`);
-  console.log(`   Twilio Phone:   ${process.env.TWILIO_PHONE_NUMBER   ? "✓ configured" : "✗ missing"}`);
-  console.log(`   Excel file:     ${EXCEL_PATH}\n`);
+  console.log(`   Twilio:      ${process.env.TWILIO_ACCOUNT_SID ? "✓ configured" : "✗ missing"}`);
+  console.log(`   Market Data: ✓ gold-api.com (free · no key needed)`);
+  console.log(`   Excel:       ${EXCEL_PATH}`);
+  console.log(`\n   Test endpoints:`);
+  console.log(`   GET http://localhost:${PORT}/api/debug-feed   ← raw API response`);
+  console.log(`   GET http://localhost:${PORT}/api/market-feed  ← formatted prices\n`);
 });
