@@ -562,7 +562,7 @@ function PriceRow({ scrip, data, buyCommission, buyCommissionType, sellCommissio
 
   const buyCommVal  = buyCommissionType  === "percent" ? ltp * (buyCommission  / 100) : Number(buyCommission);
   const sellCommVal = sellCommissionType === "percent" ? ltp * (sellCommission / 100) : Number(sellCommission);
-  const buyPrice    = Math.max(0, ltp - buyCommVal);
+  const buyPrice    = ltp + buyCommVal;
   const sellPrice   = ltp + sellCommVal;
 
   return (
@@ -728,13 +728,13 @@ function AdminPanel({ buyCommission, buyCommissionType, sellCommission, sellComm
         <div style={{ fontSize: 8, color: "var(--muted)", letterSpacing: 3, marginBottom: 14, fontWeight: 700 }}>COMMISSION SETTINGS</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 18 }}>
           <CommissionField
-            label="BUY COMMISSION (deducted from price)"
+            label="BUY COMMISSION"
             color="var(--buy)"
             value={bc} type={bt}
             onValueChange={setBc} onTypeChange={setBt}
           />
           <CommissionField
-            label="SELL COMMISSION (added to price)"
+            label="SELL COMMISSION"
             color="var(--sell)"
             value={sc} type={st}
             onValueChange={setSc} onTypeChange={setSt}
